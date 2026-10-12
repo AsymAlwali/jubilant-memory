@@ -245,6 +245,84 @@ class MemoryPipeline:
 
         return results[:limit]
 
+
+    def recall_with_conflicts(self, query, limit=5):
+        """
+        Retrieve semantic memories together with
+        their recorded conflict relationships.
+
+        Conflict status is based on stored reports,
+        not on a fresh NLI evaluation.
+        """
+
+        memories = self.recall(query, limit=limit)
+
+        for memory in memories:
+
+            memory_id = memory["id"]
+
+            rows = self.db.execute("""
+                SELECT
+                    c.id,
+                    c.relationship,
+                    c.existing_id,
+                    c.incoming_id,
+                    m1.content,
+                    m2.content
+                FROM conflicts c
+                JOIN memories m1
+                    ON c.existing_id = m1.id
+                JOIN memories m2
+                    ON c.incoming_id = m2.id
+                WHERE
+                    c.existing_id = ?
+                    OR c.incoming_id = ?
+            """, (memory_id, memory_id)).fetchall()
+
+            conflicting_memories = []
+
+            for row in rows:
+
+                (
+                    conflict_id,
+                    relationship,
+                    existing_id,
+                    incoming_id,
+                    existing_content,
+                    incoming_content
+                ) = row
+
+                # Determine which side is the other memory
+                if memory_id == existing_id:
+                    other_id = incoming_id
+                    other_content = incoming_content
+                else:
+                    other_id = existing_id
+                    other_content = existing_content
+
+                conflicting_memories.append({
+                    "conflict_id": conflict_id,
+                    "memory_id": other_id,
+                    "content": other_content,
+                    "relationship": relationship
+                })
+
+            memory["status"] = (
+                "disputed"
+                if conflicting_memories
+                else "no_recorded_conflict"
+            )
+
+            memory["conflict_count"] = len(
+                conflicting_memories
+            )
+
+            memory["conflicting_memories"] = (
+                conflicting_memories
+            )
+
+        return memories
+
     def get_conflicts(self):
 
         return self.db.execute("""
