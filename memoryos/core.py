@@ -29,7 +29,16 @@ class MemoryOS:
 
         self.db.commit()
 
-    def remember(self, content):
+    def remember(self, content, deduplicate=True, threshold=0.92):
+        if not 0 <= threshold <= 1:
+            raise ValueError("threshold must be between 0 and 1")
+
+        if deduplicate:
+            matches = self.recall(content, limit=1)
+
+            if matches and matches[0]["score"] >= threshold:
+                return matches[0]["id"]
+
         memory_id = str(uuid.uuid4())
 
         embedding = self.model.encode(
