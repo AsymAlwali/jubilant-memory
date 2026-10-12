@@ -1,0 +1,265 @@
+import json
+import sqlite3
+import uuid
+
+from pathlib import Path
+from datetime import datetime, timezone
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+from memoryos.context import ContextEngine
+from memoryos.relationships import RelationshipEngine
+
+
+class MemoryPipeline:
+
+    def __init__(self, db_path="data/pipeline.db"):
+
+        Path(db_path).parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        self.db = sqlite3.connect(db_path)
+
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                attribute TEXT NOT NULL,
+                source TEXT,
+                valid_at TEXT,
+                embedding TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS conflicts (
+                id TEXT PRIMARY KEY,
+                existing_id TEXT NOT NULL,
+                incoming_id TEXT NOT NULL,
+                relationship TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(existing_id) REFERENCES memories(id),
+                FOREIGN KEY(incoming_id) REFERENCES memories(id)
+            )
+        """)
+
+        self.db.commit()
+
+        self.embedding_model = SentenceTransformer(
+            "sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+        self.context_engine = ContextEngine(
+            relationship_engine=RelationshipEngine()
+        )
+
+    def _embed(self, text):
+
+        return self.embedding_model.encode(
+            text,
+            normalize_embeddings=True
+        ).tolist()
+
+    def remember(
+        self,
+        content,
+        subject,
+        attribute,
+        source=None,
+        valid_at=None,
+        threshold=0.50
+    ):
+
+        if not 0 <= threshold <= 1:
+            raise ValueError("Invalid similarity threshold")
+
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (content, subject, attribute)
+        ):
+            raise ValueError(
+                "Content, subject and attribute must be nonempty strings"
+            )
+
+        memory_id = str(uuid.uuid4())
+
+        embedding = self._embed(content)
+
+        incoming = {
+            "content": content,
+            "subject": subject,
+            "attribute": attribute,
+            "valid_at": valid_at
+        }
+
+        rows = self.db.execute("""
+            SELECT id, content, subject,
+                   attribute, valid_at, embedding
+            FROM memories
+        """).fetchall()
+
+        relationships = []
+
+        for row in rows:
+
+            (
+                existing_id,
+                old_content,
+                old_subject,
+                old_attribute,
+                old_time,
+                old_embedding
+            ) = row
+
+            # Check contextual identity before expensive NLI
+            if (
+                old_subject != subject
+                or old_attribute != attribute
+            ):
+                continue
+
+            vector = np.array(
+                json.loads(old_embedding)
+            )
+
+            similarity = float(
+                np.dot(embedding, vector)
+            )
+
+            if similarity < threshold:
+                continue
+
+            existing = {
+                "content": old_content,
+                "subject": old_subject,
+                "attribute": old_attribute,
+                "valid_at": old_time
+            }
+
+            result = self.context_engine.compare(
+                existing,
+                incoming
+            )
+
+            relationships.append({
+                "existing_id": existing_id,
+                "similarity": round(similarity, 4),
+                "relationship": result["relationship"],
+                "conflict": result["conflict"]
+            })
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self.db:
+
+            self.db.execute("""
+                INSERT INTO memories
+                (
+                    id, content, subject, attribute,
+                    source, valid_at, embedding, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                memory_id,
+                content,
+                subject,
+                attribute,
+                source,
+                valid_at,
+                json.dumps(embedding),
+                now
+            ))
+
+            for result in relationships:
+
+                if result["conflict"]:
+
+                    self.db.execute("""
+                        INSERT INTO conflicts
+                        (
+                            id, existing_id, incoming_id,
+                            relationship, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        str(uuid.uuid4()),
+                        result["existing_id"],
+                        memory_id,
+                        result["relationship"],
+                        now
+                    ))
+
+        return {
+            "memory_id": memory_id,
+            "relationships": relationships,
+            "conflicts_detected": sum(
+                item["conflict"]
+                for item in relationships
+            )
+        }
+
+    def recall(self, query, limit=5):
+
+        if limit < 1:
+            raise ValueError("limit must be positive")
+
+        query_vector = self._embed(query)
+
+        rows = self.db.execute("""
+            SELECT id, content, subject,
+                   attribute, embedding
+            FROM memories
+        """).fetchall()
+
+        results = []
+
+        for row in rows:
+
+            memory_id, content, subject, attribute, embedding = row
+
+            vector = np.array(
+                json.loads(embedding)
+            )
+
+            similarity = float(
+                np.dot(query_vector, vector)
+            )
+
+            results.append({
+                "id": memory_id,
+                "content": content,
+                "subject": subject,
+                "attribute": attribute,
+                "score": round(similarity, 4)
+            })
+
+        results.sort(
+            key=lambda item: item["score"],
+            reverse=True
+        )
+
+        return results[:limit]
+
+    def get_conflicts(self):
+
+        return self.db.execute("""
+            SELECT
+                c.existing_id,
+                c.incoming_id,
+                m1.content,
+                m2.content,
+                c.relationship
+            FROM conflicts c
+            JOIN memories m1
+                ON c.existing_id = m1.id
+            JOIN memories m2
+                ON c.incoming_id = m2.id
+        """).fetchall()
+
+    def close(self):
+        self.db.close()
