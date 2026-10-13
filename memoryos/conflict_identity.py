@@ -163,3 +163,94 @@ class ConflictIdentityEngine:
 
     def close(self):
         self.db.close()
+
+
+def register_conflict_in_transaction(
+    db,
+    first_id,
+    second_id,
+    relationship="potential_conflict"
+):
+    """
+    Register or reuse a conflict inside the caller's transaction.
+
+    The caller must manage BEGIN/COMMIT/ROLLBACK.
+    No new connection is opened here.
+    """
+
+    memory_a, memory_b = ConflictIdentityEngine.canonical_pair(
+        first_id,
+        second_id
+    )
+
+    existing = db.execute("""
+        SELECT conflict_id
+        FROM conflict_identity
+        WHERE memory_a = ? AND memory_b = ?
+    """, (memory_a, memory_b)).fetchone()
+
+    if existing:
+        return {
+            "conflict_id": existing[0],
+            "created": False
+        }
+
+    # Historical conflicts may exist without registry entries.
+    # Reuse an existing record instead of inserting a duplicate.
+    historical = db.execute("""
+        SELECT id
+        FROM conflicts
+        WHERE
+            (existing_id = ? AND incoming_id = ?)
+            OR
+            (existing_id = ? AND incoming_id = ?)
+        ORDER BY created_at, rowid
+        LIMIT 1
+    """, (
+        memory_a,
+        memory_b,
+        memory_b,
+        memory_a
+    )).fetchone()
+
+    if historical:
+        conflict_id = historical[0]
+        created = False
+    else:
+        conflict_id = str(uuid.uuid4())
+
+        db.execute("""
+            INSERT INTO conflicts (
+                id,
+                existing_id,
+                incoming_id,
+                relationship,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, datetime('now'))
+        """, (
+            conflict_id,
+            memory_a,
+            memory_b,
+            relationship
+        ))
+
+        created = True
+
+    db.execute("""
+        INSERT INTO conflict_identity (
+            memory_a,
+            memory_b,
+            conflict_id
+        )
+        VALUES (?, ?, ?)
+    """, (
+        memory_a,
+        memory_b,
+        conflict_id
+    ))
+
+    return {
+        "conflict_id": conflict_id,
+        "created": created
+    }

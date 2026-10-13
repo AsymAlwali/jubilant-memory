@@ -10,6 +10,7 @@ from sentence_transformers import SentenceTransformer
 
 from memoryos.context import ContextEngine
 from memoryos.relationships import RelationshipEngine
+from memoryos.conflict_identity import ConflictIdentityEngine, register_conflict_in_transaction
 
 
 class MemoryPipeline:
@@ -49,6 +50,11 @@ class MemoryPipeline:
         """)
 
         self.db.commit()
+
+        # Initialize the canonical conflict identity registry.
+        # This uses the same database file, before memory writes begin.
+        self.identity = ConflictIdentityEngine(db_path)
+        self.identity.close()
 
         self.embedding_model = SentenceTransformer(
             "sentence-transformers/all-MiniLM-L6-v2"
@@ -179,20 +185,12 @@ class MemoryPipeline:
 
                 if result["conflict"]:
 
-                    self.db.execute("""
-                        INSERT INTO conflicts
-                        (
-                            id, existing_id, incoming_id,
-                            relationship, created_at
-                        )
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (
-                        str(uuid.uuid4()),
+                    register_conflict_in_transaction(
+                        self.db,
                         result["existing_id"],
                         memory_id,
-                        result["relationship"],
-                        now
-                    ))
+                        result["relationship"]
+                    )
 
         return {
             "memory_id": memory_id,
